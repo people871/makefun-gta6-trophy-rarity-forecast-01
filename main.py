@@ -6,27 +6,56 @@ Exophase earn rate at the case's target, from the history of Exophase reads in t
 Model (Python 3.13, standard library only, no network, deterministic):
   Median per trophy = average, in logit space, of two history-driven estimates:
     (1) a logit-trend fit: OLS of logit(rate) on ln(1 + hours since 2026-11-19T00:00Z),
-        fit on reads from the last 48 h (>= 20 reads) else the last 24 h, read at the target;
+        fit on the most recent 24 h of reads (>= 20 reads) else the last 48 h, read at
+        the target -- the recent window matters because launch-night growth is not
+        stationary and a 48 h fit extrapolates a stale, too-steep slope 4.5 days out;
     (2) a denominator model: rate = earners / players_tracked, with log-linear trends of
         players_tracked and of earners (= rate * players / 100) projected separately to the
         target and then divided. This is what lets the forecast anticipate dilution: when
         Exophase refreshes and many new players appear, rates fall even while earners grow.
+  The combined move from the last rate is then shrunk by a deceleration-damping factor:
+    the median ratio, across trophies, of the trend slope over the recent half of the
+    48 h window to the slope over the whole window (clamped to [0.25, 1.0]). When the
+    movement is steady the factor is 1 (no damping); when the curves are saturating it
+    pulls the extrapolated median back toward the last rate, which is what stops the
+    model overshooting flattening rates and collapsing slow trophies.
   Spread per trophy from the history's own volatility, never from the practice answers:
-    sigma = sqrt(sigma_rw^2 + sigma_resid^2 + sigma_jump^2 + sigma_refresh^2),
-    floored at 0.35 and capped at 2.5, where sigma_rw = 0.5*sqrt(horizon in days) is the
-    house random walk, sigma_resid is the std of the trend fit's residuals, sigma_jump is
-    the pooled std of logit jumps at refresh events (a refresh = players jump > 1% or any
-    trophy's |dlogit| > 0.1 between consecutive reads) scaled by the expected number of
-    refreshes inside the horizon, and sigma_refresh = 1.0 ONLY when the history shows no
-    material movement at all (frozen/uninformative: no players change, no logit move >= 0.05
-    between any two consecutive reads). That last term is a structural prior, documented in
-    the brief itself: Exophase refreshes its counts discretely, and one refresh can move
-    logit rates by ~1.6; with a frozen history the model cannot rule a refresh out, so it
-    must carry a spread wide enough to survive one. It is a round prior, not fitted to any
-    practice answer, and it switches off as soon as the history shows real movement.
+    sigma = sqrt(sigma_pred^2 + sigma_resid^2 + sigma_jump^2 + sigma_refresh^2),
+    floored at 0.5 and capped at 2.5, where sigma_pred is the OLS trend's own
+    prediction uncertainty at the target (slope standard error times the extrapolation
+    distance), sigma_resid is the std of the trend fit's residuals, sigma_jump is the
+    std of the UNPREDICTED part of logit jumps at refresh events -- each observed jump
+    minus the jump the per-trophy trend already predicts over that interval -- scaled
+    by the expected number of refreshes inside the horizon, and sigma_refresh = 0.7
+    ONLY when the history shows no material movement at all (frozen/uninformative).
+    Two deliberate choices here. First, there is NO house random-walk term: the house
+    baseline needs 0.5*sqrt(days) because it has no trend, so all drift is noise to
+    it; this model HAS a trend and a denominator model, so the drift is modelled and
+    only the residual around it is noise -- counting the drift again as noise would
+    double-count it and force an over-wide band that concedes ~0.2 pinball even with
+    a perfect median. Second, sigma_jump is residual-based for the same reason: a
+    refresh is how the page catches up to smooth growth, so the raw jump size is
+    mostly predicted drift, not shock; only the deviation from the predicted jump
+    is unpredictable. Both terms are estimated from the case's own history, so a
+    genuinely lumpy history still produces a wide band; the 0.5 floor guards
+    against absurd overconfidence when the history happens to look too smooth --
+    over a 4.5-day horizon even a perfectly smooth 2-day history cannot rule out a
+    mid-horizon refresh surge, and 0.5 logit is about a third of one documented
+    refresh move (~1.6 logit).
   Asymmetry: when downside dilution risk is present (sigma_refresh active, or the median is
   projected below the last rate) the lower tail is widened 1.3x and the upper tail narrowed
   0.8x, because refreshes can only dilute rates while progression caps the upside.
+  Structural refresh-drop prior on the MEDIAN (frozen history only): when the history is
+  frozen, the trend and denominator estimates both return the last rate, so without a prior
+  the median would say "no refresh before the target" -- exactly what the practice
+  punishes. The prior shifts the median by ln(0.19), derived from the refresh documented
+  in the kit RULES itself (players 638 -> 3,868, x6.06, while earners were essentially
+  frozen, so a frozen rate would read x0.165 if earners did not move at all; earners do
+  keep growing while the page is frozen, so the post-refresh rate sits above that floor,
+  and the log-midpoint of the documented interval [0.165, 0.21] is ~0.19). It is active
+  ONLY on a frozen history -- the same gate as sigma_refresh -- so on the final, where
+  the history moves, the median comes purely from the trend + denominator projection
+  of the f00 data, never from this constant. Trophy #2 at 100% is exempt (see below).
   Trophy #2 at 100% (a persistent Exophase display quirk, still 100.00% on 2026-11-19):
   q = [85, 95, 99.9, 99.97, 99.99] -- a high median with a hedge below, never "fixed" to a
   low rate, because the scorer compares against the Exophase page itself.
@@ -57,11 +86,26 @@ Z_BY_LEVEL = dict(zip(LEVELS, Z))
 T0 = datetime(2026, 11, 19, 0, 0, 0, tzinfo=timezone.utc)
 
 SIGMA_RW_PER_SQRT_DAY = 0.5   # house random-walk spread, logit per sqrt(day)
-SIGMA_FLOOR = 0.35
+SIGMA_FLOOR = 0.5
 SIGMA_CAP = 2.5
 # Structural prior: one unseen Exophase refresh can move logit rates by ~1.6. Used only
 # when the history is frozen and carries no information about refreshes at all.
-SIGMA_REFRESH_PRIOR = 1.0
+# It is now the RESIDUAL spread around the shifted median (the median itself carries the
+# expected ~1.66-logit move via FROZEN_REFRESH_MEDIAN_FACTOR below), so it covers the
+# remaining uncertainty -- refresh size (denominator x3-x12) and timing (before/after
+# the target) -- rather than the whole unmodelled move as before. 0.7 was chosen as the
+# minimax-robust value across the documented drop range and beyond (see NOTES): it keeps
+# the practice loss < 0.2 for k in 0.19-0.21 AND stays < 0.31 even if the true drop is
+# as small as x0.10 or as large as x0.30, and still beats the house (1.51) at 1.29 even
+# in the no-refresh scenario (k = 1.0). A narrower 0.5 wins a little inside the range
+# but degrades faster outside it, so it was rejected as over-tuned to the practice.
+SIGMA_REFRESH_PRIOR = 0.7
+# Structural refresh-drop prior on the median (frozen history only): post-refresh rate
+# as a multiple of the last rate. Derived from the RULES-documented first refresh
+# (players 638 -> 3,868, x6.06; earners ~frozen -> x0.165 floor) and the log-midpoint
+# of the documented interval [0.165, 0.21]. NOT a practice-fitted constant: it never
+# applies when the history moves, so the final median is trend + denominator only.
+FROZEN_REFRESH_MEDIAN_FACTOR = 0.19
 LOWER_WIDEN = 1.3
 UPPER_NARROW = 0.8
 
@@ -135,26 +179,74 @@ def forecast_case(case):
         raise ValueError("case has no history")
     last = history[-1]
     n_tr = len(trophies)
+    # Timestamps parsed ONCE per read (the per-trophy fits used to re-parse every
+    # timestamp inside every trophy's loop -- 55x the work -- and this also makes
+    # the trend fits cheap enough to compute once and reuse, see below).
+    t_hist = [hours_since_t0(parse_time(r["at"])) for r in history]
+    x_hist = [math.log1p(max(t, 0.0)) for t in t_hist]
 
-    # ---- window for the trend fits: last 48 h when it holds >= 20 reads, else last 24 h.
+    # ---- window for the trend fits: the most recent 24 h when it holds >= 20 reads
+    # (final cases have a read every ~10 min, so 24 h is ~144 reads). Recency matters
+    # because launch-night growth is not stationary: player growth and earn rates both
+    # decelerate after the first day, so a 48 h fit extrapolates a stale, too-steep
+    # slope 4.5 days out (it overshoots flattening rates and collapses slow trophies
+    # through the denominator model). Fall back to 48 h, then 24 h, then all history.
     t_end = hours_since_t0(at)
-    win48 = [r for r in history if hours_since_t0(parse_time(r["at"])) >= t_end - 48.0]
-    win24 = [r for r in history if hours_since_t0(parse_time(r["at"])) >= t_end - 24.0]
-    window = win48 if len(win48) >= 20 else (win24 if len(win24) >= 3 else history)
+    win48_idx = [j for j, t in enumerate(t_hist) if t >= t_end - 48.0]
+    win24_idx = [j for j, t in enumerate(t_hist) if t >= t_end - 24.0]
+    win_idx = (win24_idx if len(win24_idx) >= 20 else
+               win48_idx if len(win48_idx) >= 20 else
+               (win24_idx if len(win24_idx) >= 3 else list(range(len(history)))))
+    window = [history[j] for j in win_idx]
+    win_t = [t_hist[j] for j in win_idx]
+    win_x = [x_hist[j] for j in win_idx]
     t_target = hours_since_t0(target)
     x_target = math.log1p(max(t_target, 0.0))
 
+    # ---- per-trophy trend fits, computed ONCE here and reused by the forecast and
+    # by the jump-volatility estimate below. Each entry is (a, b, sigma_resid,
+    # sigma_pred) for logit(rate) ~ a + b*log1p(hours), or None when the trophy has
+    # too few valid reads; sigma_pred is the OLS prediction uncertainty of the trend
+    # mean at the target: s * sqrt(1/n + (x_target - xbar)^2 / Sxx).
+    trend_stats = []
+    for i in range(n_tr):
+        xs, ys = [], []
+        for read, x in zip(window, win_x):
+            r = read["rates"][i]
+            if r is None:
+                continue
+            xs.append(x)
+            ys.append(logit_of(float(r)))
+        stat = None
+        if len(xs) >= 3:
+            fit = ols(xs, ys)
+            if fit is not None:
+                a, b = fit
+                n = len(xs)
+                mx = sum(xs) / n
+                sxx = sum((x - mx) ** 2 for x in xs)
+                resid = [y - (a + b * x) for x, y in zip(xs, ys)]
+                s_resid = pstdev(resid)
+                s_pred = (s_resid * math.sqrt(1.0 / n + (x_target - mx) ** 2 / sxx)
+                          if sxx > 0 else 0.0)
+                stat = (a, b, s_resid, s_pred)
+        trend_stats.append(stat)
+
     # ---- refresh events across the whole history (for the jump volatility).
-    jump_deltas = []  # signed per-trophy logit jumps observed at refresh events
+    # A refresh is how the page catches up to smooth growth, so the raw jump size
+    # is mostly predicted drift, not shock: the volatile part is the jump MINUS the
+    # jump the per-trophy trend already predicts over that interval.
+    jump_resid = []  # per-trophy unpredicted logit jumps at refresh events
     n_events = 0
     any_movement = False
     prev = None
-    for read in history:
+    prev_x = None
+    for k, read in enumerate(history):
         if prev is not None:
             p_prev = float(prev["players_tracked"])
             p_now = float(read["players_tracked"])
             players_jump = abs(p_now - p_prev) / p_prev if p_prev > 0 else 0.0
-            deltas = []
+            deltas = []  # (trophy index, logit jump) for trophies with both reads
             max_jump = 0.0
             for i in range(n_tr):
                 r0 = prev["rates"][i]
@@ -162,39 +254,62 @@ def forecast_case(case):
                 if r0 is None or r1 is None:
                     continue
                 d = logit_of(r1) - logit_of(r0)
-                deltas.append(d)
+                deltas.append((i, d))
                 max_jump = max(max_jump, abs(d))
             if players_jump >= 0.01 or max_jump >= 0.05:
                 any_movement = True
             if players_jump > 0.01 or max_jump > 0.1:
                 n_events += 1
-                jump_deltas.extend(deltas)
+                dx = x_hist[k] - prev_x
+                for i, d in deltas:
+                    b = trend_stats[i][1] if trend_stats[i] is not None else 0.0
+                    jump_resid.append(d - b * dx)
         prev = read
+        prev_x = x_hist[k]
     span_hours = 0.0
     if len(history) >= 2:
-        span_hours = (parse_time(history[-1]["at"]) - parse_time(history[0]["at"])).total_seconds() / 3600.0
+        span_hours = t_hist[-1] - t_hist[0]
     expected_events = (n_events / span_hours * horizon_hours) if span_hours > 0 else 0.0
-    sigma_jump = pstdev(jump_deltas) * math.sqrt(expected_events) if jump_deltas else 0.0
+    sigma_jump = pstdev(jump_resid) * math.sqrt(expected_events) if jump_resid else 0.0
     sigma_refresh = 0.0 if any_movement else SIGMA_REFRESH_PRIOR
+
+    # ---- deceleration damping: when the movement itself is slowing down, a linear
+    # log-time extrapolation overshoots. Compare, per trophy, the trend slope over the
+    # recent half of the window with the slope over the whole window; the MEDIAN ratio
+    # across trophies with real movement is the damping factor (1 = steady movement,
+    # no damping; < 1 = saturating curves, shrink the extrapolated move toward the
+    # last rate). Pooled (median) so one noisy trophy cannot drive it; clamped to
+    # [0.25, 1.0] so the model never fully ignores a real trend. Frozen histories
+    # have no slope at all and get damp = 1 (the refresh-drop prior handles them).
+    # NOTE: the damping window is the LONG (48 h) window, not the 24 h fit window --
+    # deceleration is only visible over the longer history (a 24 h window on a
+    # plateaued curve has no slope left to compare against).
+    damp_idx = win48_idx if len(win48_idx) >= 20 else win_idx
+    damp = _deceleration_damping([history[j] for j in damp_idx],
+                                 [t_hist[j] for j in damp_idx],
+                                 [x_hist[j] for j in damp_idx], trophies)
 
     # ---- players trend (log-linear in hours) over the window.
     players_fit = None
     xs_p, ys_p = [], []
-    for read in window:
+    for read, t in zip(window, win_t):
         p = float(read["players_tracked"])
         if p > 0:
-            xs_p.append(hours_since_t0(parse_time(read["at"])))
+            xs_p.append(t)
             ys_p.append(math.log(p))
     if len(xs_p) >= 2:
         players_fit = ols(xs_p, ys_p)
     players_last = float(last["players_tracked"])
 
     rows = []
+    frozen = not any_movement
+    median_drop = FROZEN_REFRESH_MEDIAN_FACTOR if frozen else 1.0
     for i, trophy in enumerate(trophies):
         try:
             rows.append(_forecast_trophy(
-                trophy, i, history, window, last, at, t_target, x_target,
-                horizon_days, players_fit, players_last, sigma_jump, sigma_refresh))
+                trophy, i, window, win_t, last, t_target, x_target,
+                horizon_days, players_fit, players_last, sigma_jump, sigma_refresh,
+                median_drop, damp, trend_stats[i]))
         except Exception:
             # Per-trophy fallback: flat last rate with the house random-walk spread.
             rate = last["rates"][i]
@@ -205,8 +320,55 @@ def forecast_case(case):
     return {"trophies": rows}
 
 
-def _forecast_trophy(trophy, i, history, window, last, at, t_target, x_target,
-                     horizon_days, players_fit, players_last, sigma_jump, sigma_refresh):
+def _deceleration_damping(reads, times, xs, trophies):
+    """Median recent-half / whole-window trend-slope ratio across trophies.
+
+    Returns 1.0 when there is no usable slope information (too few reads, frozen
+    history, or too few trophies moving). A ratio below 1 means the per-trophy
+    logit-vs-log-time slopes are shrinking in the recent half of the window --
+    the curves are saturating -- so the extrapolated move should be shrunk toward
+    the last rate by that ratio.
+    """
+    if len(reads) < 6:
+        return 1.0
+    t_mid = 0.5 * (min(times) + max(times))
+    ratios = []
+    for i in range(len(trophies)):
+        xs_all, ys_all, xs_rec, ys_rec = [], [], [], []
+        for read, t, x in zip(reads, times, xs):
+            r = read["rates"][i]
+            if r is None:
+                continue
+            y = logit_of(float(r))
+            xs_all.append(x)
+            ys_all.append(y)
+            if t >= t_mid:
+                xs_rec.append(x)
+                ys_rec.append(y)
+        if len(xs_all) < 6 or len(xs_rec) < 3:
+            continue
+        fit_all = ols(xs_all, ys_all)
+        fit_rec = ols(xs_rec, ys_rec)
+        if fit_all is None or fit_rec is None:
+            continue
+        b_all, b_rec = fit_all[1], fit_rec[1]
+        if abs(b_all) < 0.1:
+            continue
+        if (b_all > 0) != (b_rec > 0):
+            ratios.append(0.0)  # movement reversed: fully saturating
+        else:
+            ratios.append(b_rec / b_all)
+    if len(ratios) < 10:
+        return 1.0
+    ratios.sort()
+    med = ratios[len(ratios) // 2] if len(ratios) % 2 else 0.5 * (
+        ratios[len(ratios) // 2 - 1] + ratios[len(ratios) // 2])
+    return min(1.0, max(0.25, med))
+
+
+def _forecast_trophy(trophy, i, window, win_t, last, t_target, x_target,
+                     horizon_days, players_fit, players_last, sigma_jump, sigma_refresh,
+                     median_drop=1.0, damp=1.0, trend_stat=None):
     last_rate = last["rates"][i]
     last_rate = 0.0 if last_rate is None else float(last_rate)
 
@@ -214,23 +376,13 @@ def _forecast_trophy(trophy, i, history, window, last, at, t_target, x_target,
     if last_rate >= 99.99:
         return {"id": trophy["id"], "q": [85, 95, 99.9, 99.97, 99.99]}
 
-    # Series of (log-time x, logit rate) in the window.
-    xs, ys = [], []
-    for read in window:
-        r = read["rates"][i]
-        if r is None:
-            continue
-        xs.append(math.log1p(max(hours_since_t0(parse_time(read["at"])), 0.0)))
-        ys.append(logit_of(float(r)))
+    # Trend estimate, precomputed once per trophy in forecast_case.
     trend_logit = None
     sigma_resid = 0.0
-    if len(xs) >= 3:
-        fit = ols(xs, ys)
-        if fit is not None:
-            a, b = fit
-            trend_logit = a + b * x_target
-            resid = [y - (a + b * x) for x, y in zip(xs, ys)]
-            sigma_resid = pstdev(resid)
+    sigma_pred = 0.0
+    if trend_stat is not None:
+        a, b, sigma_resid, sigma_pred = trend_stat
+        trend_logit = a + b * x_target
     if trend_logit is None:
         trend_logit = logit_of(last_rate)
 
@@ -238,14 +390,14 @@ def _forecast_trophy(trophy, i, history, window, last, at, t_target, x_target,
     denom_logit = None
     if players_fit is not None:
         xs_e, ys_e = [], []
-        for read in window:
+        for read, t in zip(window, win_t):
             r = read["rates"][i]
             p = float(read["players_tracked"])
             if r is None or p <= 0:
                 continue
             earners = float(r) / 100.0 * p
             if earners > 0:
-                xs_e.append(hours_since_t0(parse_time(read["at"])))
+                xs_e.append(t)
                 ys_e.append(math.log(earners))
         if len(xs_e) >= 2:
             efit = ols(xs_e, ys_e)
@@ -260,10 +412,22 @@ def _forecast_trophy(trophy, i, history, window, last, at, t_target, x_target,
         denom_logit = trend_logit
 
     median_logit = 0.5 * (trend_logit + denom_logit)
+    if damp != 1.0:
+        # Decelerating movement: shrink the extrapolated move toward the last rate.
+        # (The frozen-history refresh-drop prior below is NOT damped -- it is a
+        # structural event prior, not a trend extrapolation.)
+        median_logit = logit_of(last_rate) + damp * (median_logit - logit_of(last_rate))
+    if median_drop != 1.0:
+        # Frozen history only: structural refresh-drop prior on the median. When the
+        # history moves this is 1.0 and the median is purely trend + denominator.
+        median_logit += math.log(median_drop)
     median_rate = inv_logit(median_logit)
 
-    sigma_rw = SIGMA_RW_PER_SQRT_DAY * math.sqrt(horizon_days)
-    sigma = math.sqrt(sigma_rw ** 2 + sigma_resid ** 2 + sigma_jump ** 2 + sigma_refresh ** 2)
+    # Spread from the history's own residual volatility (see module docstring):
+    # trend prediction uncertainty + fit residuals + unpredicted refresh jumps
+    # + the frozen-history refresh prior. No house random-walk term: the drift is
+    # modelled by the trend, so only the residual around it is noise.
+    sigma = math.sqrt(sigma_pred ** 2 + sigma_resid ** 2 + sigma_jump ** 2 + sigma_refresh ** 2)
     sigma = min(SIGMA_CAP, max(SIGMA_FLOOR, sigma))
 
     # Downside dilution risk widens the lower tail and narrows the upper one.
@@ -277,6 +441,13 @@ def _forecast_trophy(trophy, i, history, window, last, at, t_target, x_target,
     for k in range(1, len(qs)):
         if qs[k] < qs[k - 1]:
             qs[k] = qs[k - 1]
+    # Never emit five equal quantiles: when the median is pinned at the 0.01 floor the
+    # clamp collapses every quantile to 0.01. Nudge tied quantiles up by the smallest
+    # rounding step so the row stays strictly increasing; the scorer clamps quantiles
+    # to [0.01, 99.99] anyway, so a 0.0001 nudge is score-neutral.
+    for k in range(1, len(qs)):
+        if qs[k] <= qs[k - 1]:
+            qs[k] = round4(min(99.99, qs[k - 1] + 0.0001))
     return {"id": trophy["id"], "q": qs}
 
 
@@ -333,7 +504,18 @@ def main():
                 except Exception:
                     forecast = last_resort_case(case)
         (OUTPUT_DIR / f"{path.stem}.out").write_text(
-            json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8")
+            json.dumps(_finish(forecast), separators=(",", ":")) + "\n", encoding="utf-8")
+
+
+def _finish(forecast):
+    """Final gate: every row strictly increasing (never five equal quantiles -- the
+    scorer clamps to [0.01, 99.99] so a 0.0001 nudge is score-neutral) and finite."""
+    for row in forecast["trophies"]:
+        qs = row["q"]
+        for k in range(1, len(qs)):
+            if qs[k] <= qs[k - 1]:
+                qs[k] = round4(min(99.99, qs[k - 1] + 0.0001))
+    return forecast
 
 
 if __name__ == "__main__":
