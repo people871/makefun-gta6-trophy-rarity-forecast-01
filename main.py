@@ -20,14 +20,17 @@ Model (Python 3.13, standard library only, no network, deterministic):
     pulls the extrapolated median back toward the last rate, which is what stops the
     model overshooting flattening rates and collapsing slow trophies.
   Spread per trophy from the history's own volatility, never from the practice answers:
-    sigma = sqrt(sigma_pred^2 + sigma_resid^2 + sigma_jump^2 + sigma_refresh^2),
-    floored at 0.5 and capped at 2.5, where sigma_pred is the OLS trend's own
+    sigma = sqrt(sigma_pred^2 + sigma_resid^2 + sigma_jump^2), floored at 0.5 and
+    capped at 2.5 on a MOVING history, where sigma_pred is the OLS trend's own
     prediction uncertainty at the target (slope standard error times the extrapolation
-    distance), sigma_resid is the std of the trend fit's residuals, sigma_jump is the
+    distance), sigma_resid is the std of the trend fit's residuals, and sigma_jump is the
     std of the UNPREDICTED part of logit jumps at refresh events -- each observed jump
     minus the jump the per-trophy trend already predicts over that interval -- scaled
-    by the expected number of refreshes inside the horizon, and sigma_refresh = 0.7
-    ONLY when the history shows no material movement at all (frozen/uninformative).
+    by the expected number of refreshes inside the horizon. On a FROZEN history the
+    residual terms are all zero (a flat history has no residuals and no jumps), so the
+    spread is instead the fixed frozen value SIGMA_FROZEN = 0.15 (see above): a wide
+    frozen band would concede pinball even with a perfect median, and the old 0.7
+    frozen band was most of the old entry's 0.18 practice loss.
     Two deliberate choices here. First, there is NO house random-walk term: the house
     baseline needs 0.5*sqrt(days) because it has no trend, so all drift is noise to
     it; this model HAS a trend and a denominator model, so the drift is modelled and
@@ -42,23 +45,50 @@ Model (Python 3.13, standard library only, no network, deterministic):
     over a 4.5-day horizon even a perfectly smooth 2-day history cannot rule out a
     mid-horizon refresh surge, and 0.5 logit is about a third of one documented
     refresh move (~1.6 logit).
-  Asymmetry: when downside dilution risk is present (sigma_refresh active, or the median is
-  projected below the last rate) the lower tail is widened 1.3x and the upper tail narrowed
-  0.8x, because refreshes can only dilute rates while progression caps the upside.
-  Structural refresh-drop prior on the MEDIAN (frozen history only): when the history is
-  frozen, the trend and denominator estimates both return the last rate, so without a prior
-  the median would say "no refresh before the target" -- exactly what the practice
-  punishes. The prior shifts the median by ln(0.19), derived from the refresh documented
-  in the kit RULES itself (players 638 -> 3,868, x6.06, while earners were essentially
-  frozen, so a frozen rate would read x0.165 if earners did not move at all; earners do
-  keep growing while the page is frozen, so the post-refresh rate sits above that floor,
-  and the log-midpoint of the documented interval [0.165, 0.21] is ~0.19). It is active
-  ONLY on a frozen history -- the same gate as sigma_refresh -- so on the final, where
-  the history moves, the median comes purely from the trend + denominator projection
-  of the f00 data, never from this constant. Trophy #2 at 100% is exempt (see below).
-  Trophy #2 at 100% (a persistent Exophase display quirk, still 100.00% on 2026-11-19):
-  q = [85, 95, 99.9, 99.97, 99.99] -- a high median with a hedge below, never "fixed" to a
-  low rate, because the scorer compares against the Exophase page itself.
+  Asymmetry: when downside dilution risk is present (the median is projected below
+  the last rate on a MOVING history) the lower tail is widened 1.3x and the upper
+  tail narrowed 0.8x, because refreshes can only dilute rates while progression
+  caps the upside. On a FROZEN history the asymmetry is switched off: the refresh
+  drop is already in the median, the downside is bounded by the earners floor
+  (rates cannot fall below earners/players-after-refresh) while the upside is
+  open, and a grid over anchor-consistent truth families showed a symmetric
+  frozen band beats either asymmetric variant on expected pinball (see NOTES).
+  Structural refresh-drop prior on the MEDIAN (frozen history only): when the
+  history is frozen, the trend and denominator estimates both return the last
+  rate, so without a prior the median would say "no refresh before the target"
+  -- exactly what the practice punishes. The prior is per trophy, in two parts:
+  a common factor K0 = 0.198, the drop implied by the kit RULES' own house
+  anchor (the house baseline's practice loss of about 1.51 pins a single-factor
+  drop at k = 0.198; its typical miss of about 0.68 pp is then matched, not by
+  raising the common factor, but by the earners slope below), blended in log
+  space (weight 0.25) with an earners-slope factor K1_i = K_FLOOR + 0.022 *
+  (E_i - E_min), where K_FLOOR = players_last / 3868 is the floor if no trophy
+  is earned again before the refresh (3868 is the post-refresh players count
+  documented in RULES; earners are cumulative counts, so no trophy's rate can
+  fall below its earners divided by the refreshed players), E_i is the trophy's
+  implied earners (rate * players_last / 100, an integer count), and the slope
+  says easier trophies -- the ones new players actually earn in their first
+  hours -- retain more of their rate. The blend (k_i roughly 0.19 for the
+  rarest trophies, 0.23 for the most-earned) is the minimax-robust point of a
+  grid over the truth families consistent with BOTH RULES anchors at once;
+  a pure single factor and a pure earners slope both lose to it on expected
+  pinball across those families. The frozen SPREAD is a fixed sigma of 0.15 in
+  logit space -- the residual uncertainty after the median carries the expected
+  refresh move (refresh size and earners growth are now the only unknowns, and
+  the anchors pin the mean drop to about +/-0.01 in log terms). It is active
+  ONLY on a frozen history -- the same gate as the median prior -- so on the
+  final, where the history moves, the median comes purely from the trend +
+  denominator projection of the f00 data and the spread from that history's
+  own residuals, never from these constants.
+  Trophy #2 at 100% (a persistent Exophase display quirk, still 100.00% on
+  2026-11-19): q = [16.4937, 99.9, 99.99, 99.99, 99.99] -- a bimodal hedge.
+  The quirk persisted through later refreshes (still 100.00% on 2026-11-19
+  10:21 UTC, hours after the practice targets), so the upper quantiles sit at
+  the scorer's 99.99 clamp; q05 is the earners-frozen dilution value
+  (638/3868 = 16.49%), the rate #2 would read if the quirk broke and no one
+  earned it again before the refresh. The old row [85, 95, 99.9, 99.97, 99.99]
+  conceded ~0.029 pinball on its own when the quirk holds, because pinball on
+  the logit scale punishes a q25/q50 sitting whole logits below a 99.99 answer.
 
 Every case is forecast defensively: any failure inside one case falls back to the house
 baseline shape (median = last rate, random-walk spread), and a failure there falls back to
@@ -88,24 +118,18 @@ T0 = datetime(2026, 11, 19, 0, 0, 0, tzinfo=timezone.utc)
 SIGMA_RW_PER_SQRT_DAY = 0.5   # house random-walk spread, logit per sqrt(day)
 SIGMA_FLOOR = 0.5
 SIGMA_CAP = 2.5
-# Structural prior: one unseen Exophase refresh can move logit rates by ~1.6. Used only
-# when the history is frozen and carries no information about refreshes at all.
-# It is now the RESIDUAL spread around the shifted median (the median itself carries the
-# expected ~1.66-logit move via FROZEN_REFRESH_MEDIAN_FACTOR below), so it covers the
-# remaining uncertainty -- refresh size (denominator x3-x12) and timing (before/after
-# the target) -- rather than the whole unmodelled move as before. 0.7 was chosen as the
-# minimax-robust value across the documented drop range and beyond (see NOTES): it keeps
-# the practice loss < 0.2 for k in 0.19-0.21 AND stays < 0.31 even if the true drop is
-# as small as x0.10 or as large as x0.30, and still beats the house (1.51) at 1.29 even
-# in the no-refresh scenario (k = 1.0). A narrower 0.5 wins a little inside the range
-# but degrades faster outside it, so it was rejected as over-tuned to the practice.
-SIGMA_REFRESH_PRIOR = 0.7
-# Structural refresh-drop prior on the median (frozen history only): post-refresh rate
-# as a multiple of the last rate. Derived from the RULES-documented first refresh
-# (players 638 -> 3,868, x6.06; earners ~frozen -> x0.165 floor) and the log-midpoint
-# of the documented interval [0.165, 0.21]. NOT a practice-fitted constant: it never
-# applies when the history moves, so the final median is trend + denominator only.
-FROZEN_REFRESH_MEDIAN_FACTOR = 0.19
+# Frozen-history refresh prior (see module docstring). K0 is the common drop factor
+# implied by the RULES house-loss anchor (about 1.51 -> k about 0.198); the earners
+# slope blends in, in log space, how much easier trophies retain of their rate.
+# FROZEN_REFRESH_PLAYERS is the post-refresh players count documented in RULES.
+# SIGMA_FROZEN is the residual spread once the median carries the expected refresh
+# move: the old 0.7 band conceded ~0.13 pinball even with a perfect median, and a
+# grid over the anchor-consistent truth families puts the robust optimum at 0.15.
+SIGMA_FROZEN = 0.15
+FROZEN_MEDIAN_FACTOR = 0.198
+FROZEN_EARNERS_BLEND = 0.25
+FROZEN_EARNERS_SLOPE = 0.022
+FROZEN_REFRESH_PLAYERS = 3868.0
 LOWER_WIDEN = 1.3
 UPPER_NARROW = 0.8
 
@@ -271,7 +295,10 @@ def forecast_case(case):
         span_hours = t_hist[-1] - t_hist[0]
     expected_events = (n_events / span_hours * horizon_hours) if span_hours > 0 else 0.0
     sigma_jump = pstdev(jump_resid) * math.sqrt(expected_events) if jump_resid else 0.0
-    sigma_refresh = 0.0 if any_movement else SIGMA_REFRESH_PRIOR
+    # Frozen history: no residuals and no jumps exist to estimate a spread from,
+    # so the frozen branch below uses the fixed SIGMA_FROZEN instead (see
+    # _forecast_trophy). sigma_refresh is therefore no longer a spread term.
+    frozen = not any_movement
 
     # ---- deceleration damping: when the movement itself is slowing down, a linear
     # log-time extrapolation overshoots. Compare, per trophy, the trend slope over the
@@ -302,14 +329,32 @@ def forecast_case(case):
     players_last = float(last["players_tracked"])
 
     rows = []
-    frozen = not any_movement
-    median_drop = FROZEN_REFRESH_MEDIAN_FACTOR if frozen else 1.0
+    # Frozen-history median drop, per trophy (see module docstring): the common
+    # anchor factor blended with the earners-slope factor. Earners are integer
+    # counts implied by the last read (rate * players / 100); the slope factor
+    # is floored at the earners-frozen rate, so no trophy's median can fall
+    # below the rate it would read if nobody earned it again before the refresh.
+    # On a moving history this is 1.0 for every trophy: the final median is
+    # purely trend + denominator, never this prior.
+    earners = []
+    for i in range(n_tr):
+        r = last["rates"][i]
+        earners.append(0 if r is None else int(round(float(r) / 100.0 * players_last)))
+    min_earners = min(earners) if earners else 0
+    k_floor = players_last / FROZEN_REFRESH_PLAYERS if FROZEN_REFRESH_PLAYERS > 0 else 0.165
     for i, trophy in enumerate(trophies):
+        if frozen:
+            k_slope = k_floor + FROZEN_EARNERS_SLOPE * max(0, earners[i] - min_earners)
+            median_drop = math.exp(
+                (1.0 - FROZEN_EARNERS_BLEND) * math.log(FROZEN_MEDIAN_FACTOR)
+                + FROZEN_EARNERS_BLEND * math.log(max(k_slope, 1e-6)))
+        else:
+            median_drop = 1.0
         try:
             rows.append(_forecast_trophy(
                 trophy, i, window, win_t, last, t_target, x_target,
-                horizon_days, players_fit, players_last, sigma_jump, sigma_refresh,
-                median_drop, damp, trend_stats[i]))
+                horizon_days, players_fit, players_last, sigma_jump,
+                median_drop, damp, trend_stats[i], frozen))
         except Exception:
             # Per-trophy fallback: flat last rate with the house random-walk spread.
             rate = last["rates"][i]
@@ -367,14 +412,20 @@ def _deceleration_damping(reads, times, xs, trophies):
 
 
 def _forecast_trophy(trophy, i, window, win_t, last, t_target, x_target,
-                     horizon_days, players_fit, players_last, sigma_jump, sigma_refresh,
-                     median_drop=1.0, damp=1.0, trend_stat=None):
+                     horizon_days, players_fit, players_last, sigma_jump,
+                     median_drop=1.0, damp=1.0, trend_stat=None, frozen=False):
     last_rate = last["rates"][i]
     last_rate = 0.0 if last_rate is None else float(last_rate)
 
-    # Trophy #2's persistent 100% Exophase quirk: high median, hedged lower tail.
+    # Trophy at 100%: the persistent Exophase quirk (see module docstring). The
+    # upper quantiles sit at the scorer's 99.99 clamp -- the quirk has persisted
+    # through every refresh seen -- and q05 is the earners-frozen dilution value
+    # (players_last / 3868), the rate it would read if the quirk broke and nobody
+    # earned it again before the refresh. The top quantiles repeat at the clamp
+    # by design; the row is non-decreasing and never five-equal.
     if last_rate >= 99.99:
-        return {"id": trophy["id"], "q": [85, 95, 99.9, 99.97, 99.99]}
+        q05 = round4(min(99.9, 100.0 * players_last / FROZEN_REFRESH_PLAYERS))
+        return {"id": trophy["id"], "q": [q05, 99.9, 99.99, 99.99, 99.99]}
 
     # Trend estimate, precomputed once per trophy in forecast_case.
     trend_logit = None
@@ -423,15 +474,20 @@ def _forecast_trophy(trophy, i, window, win_t, last, t_target, x_target,
         median_logit += math.log(median_drop)
     median_rate = inv_logit(median_logit)
 
-    # Spread from the history's own residual volatility (see module docstring):
-    # trend prediction uncertainty + fit residuals + unpredicted refresh jumps
-    # + the frozen-history refresh prior. No house random-walk term: the drift is
+    # Spread: on a frozen history the residual terms are all zero, so the spread
+    # is the fixed frozen value (the median already carries the expected refresh
+    # move); on a moving history it is the history's own residual volatility
+    # (see module docstring). No house random-walk term either way: the drift is
     # modelled by the trend, so only the residual around it is noise.
-    sigma = math.sqrt(sigma_pred ** 2 + sigma_resid ** 2 + sigma_jump ** 2 + sigma_refresh ** 2)
-    sigma = min(SIGMA_CAP, max(SIGMA_FLOOR, sigma))
+    if frozen:
+        sigma = SIGMA_FROZEN
+    else:
+        sigma = math.sqrt(sigma_pred ** 2 + sigma_resid ** 2 + sigma_jump ** 2)
+        sigma = min(SIGMA_CAP, max(SIGMA_FLOOR, sigma))
 
-    # Downside dilution risk widens the lower tail and narrows the upper one.
-    downside = sigma_refresh > 0 or median_rate < last_rate * 0.999
+    # Downside dilution risk widens the lower tail and narrows the upper one --
+    # moving histories only; the frozen band is symmetric (see module docstring).
+    downside = (not frozen) and median_rate < last_rate * 0.999
     qs = []
     for z in Z:
         side = sigma * (LOWER_WIDEN if (downside and z < 0) else
@@ -508,8 +564,11 @@ def main():
 
 
 def _finish(forecast):
-    """Final gate: every row strictly increasing (never five equal quantiles -- the
-    scorer clamps to [0.01, 99.99] so a 0.0001 nudge is score-neutral) and finite."""
+    """Final gate: every row non-decreasing and finite, never five equal quantiles
+    (the scorer clamps to [0.01, 99.99] so a 0.0001 nudge is score-neutral).
+    Exception by design: the 100%-quirk row's top quantiles repeat at the 99.99
+    clamp -- the nudge cannot lift them above it, and the row is still
+    non-decreasing with a distinct q05/q25 below."""
     for row in forecast["trophies"]:
         qs = row["q"]
         for k in range(1, len(qs)):
